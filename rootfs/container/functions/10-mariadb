@@ -47,19 +47,19 @@ mariadb_bootstrap_variables() {
                         MARIADB_USER
 
     if [ -n "${MARIADB_ROOT_PASSWORD}" ]; then
-        ROOT_PASS=${MYSQL_ROOT_PASSWORD}
+        ROOT_PASS=${MARIADB_ROOT_PASSWORD}
     fi
 
-    if [ -n "${MARIDB_DATABASE}" ]; then
-        DB_NAME=${MYSQL_DATABASE}
+    if [ -n "${MARIADB_DATABASE}" ]; then
+        DB_NAME=${MARIADB_DATABASE}
     fi
 
     if [ -n "${MARIADB_USER}" ]; then
-        DB_USER=${MYSQL_USER}
+        DB_USER=${MARIADB_USER}
     fi
 
     if [ -n "$MARIADB_PASSWORD" ]; then
-        DB_PASS=${MYSQL_PASSWORD}
+        DB_PASS=${MARIADB_PASSWORD}
     fi
 
     transform_var file \
@@ -148,7 +148,7 @@ mariadb_configure_monitoring() {
             "zabbix" )
                 monitoring_init_file=$(sudo -u mariadb mktemp)
                 monitor_password=$(pwgen 32 1 -s -v)
-                cat <<EOSQL | silent sudo -u mariadb tee "${monitoring_init_file}"
+                write_file mariadb@"${monitoring_init_file}" <<EOSQL
 USE mysql;
 DELETE FROM mysql.user WHERE User='zbx_monitor';
 FLUSH PRIVILEGES;
@@ -161,8 +161,18 @@ GRANT REPLICATION CLIENT,PROCESS,SHOW DATABASES,SHOW VIEW ON *.* TO 'zbx_monitor
 GRANT REPLICATION CLIENT,PROCESS,SHOW DATABASES,SHOW VIEW ON *.* TO 'zbx_monitor'@'localhost';
 EOSQL
 
-                mariadb_control_server start "--init-file=${monitoring_init_file}"
-                mariadb_control_server stop
+                mariadb_control_server start "--init-file=${monitoring_init_file}" || {
+                    print_error "Monitoring setup failed to start - halting initialization"
+                    pkill -f "/usr/bin/mariadbd"
+                    rm -f "${monitoring_init_file}"
+                    exit 1
+                }
+                mariadb_control_server stop || {
+                    print_error "Monitoring setup server did not stop cleanly - halting initialization"
+                    pkill -f "/usr/bin/mariadbd"
+                    rm -f "${monitoring_init_file}"
+                    exit 1
+                }
                 rm -f "${monitoring_init_file}"
 
                 print_debug "Configuring modern Zabbix agent"
@@ -187,6 +197,20 @@ EOF
 }
 
 mariadb_control_server() {
+
+    _wait_for_stop() {
+        local _socket="${SOCKET_PATH%/}/${SOCKET_FILE}"
+        local _tries=60
+        while [ "${_tries}" -gt 0 ] ; do
+            if [ ! -S "${_socket}" ] && [ ! -e "${_socket}" ] ; then
+                return 0
+            fi
+            sleep 0.5
+            _tries=$((_tries - 1))
+        done
+        return 1
+    }
+
     case "${1}" in
         start )
             if [ "${2}" != "--skip-grant-tables" ] ; then sanity_var "ROOT_PASS" "ROOT Password" ; fi
@@ -197,16 +221,38 @@ mariadb_control_server() {
                                                                         --skip-networking=on \
                                                                         --user=mariadb ${2} > /dev/null &
 
-            wait_for_socket "${SOCKET_PATH%/}"/"${SOCKET_FILE}"
+            if ! wait_for_socket "${SOCKET_PATH%/}"/"${SOCKET_FILE}" ; then
+                print_error "MariaDB failed to come up (${2:-default start}) - cleaning up orphaned process"
+                pkill -f /usr/bin/mariadbd
+                return 1
+            fi
         ;;
         stop )
             export MYSQL_PWD="${ROOT_PASS}"
-            TZ=${TIMEZONE} silent s6-setuidgid mariadb \
+            if ! TZ=${TIMEZONE} silent s6-setuidgid mariadb \
                                                         mariadb-admin \
                                                                     --socket "${SOCKET_PATH%/}"/"${SOCKET_FILE}" \
                                                                     -uroot \
-                                                                    shutdown
+                                                                    shutdown ; then
+                print_error "MariaDB shutdown command failed - attempting to kill orphaned process"
+                unset MYSQL_PWD
+                pkill -f /usr/bin/mariadbd
+                if ! _wait_for_stop ; then
+                    print_error "MariaDB process did not exit after failed shutdown"
+                    return 1
+                fi
+                return 1
+            fi
             unset MYSQL_PWD
+            if ! _wait_for_stop ; then
+                print_error "MariaDB did not stop in time - killing orphaned process"
+                pkill -f /usr/bin/mariadbd
+                if ! _wait_for_stop ; then
+                    print_error "MariaDB process did not exit - datadir may still be locked"
+                    return 1
+                fi
+                return 1
+            fi
         ;;
     esac
 }
@@ -243,7 +289,10 @@ EOF
             fi
         }
 
-        mariadb_control_server start "--skip-grant-tables"
+        mariadb_control_server start "--skip-grant-tables" || {
+            print_error "[create_databases] Could not start temporary server - halting initialization"
+            exit 1
+        }
         transform_var file \
                             DB_NAME \
                             DB_USER \
@@ -252,12 +301,37 @@ EOF
         if [ -n "${DB_USER}" ] && [ -z "${DB01_USER}" ] ; then export DB01_USER="${DB_USER}" ; unset DB_USER ; fi
         if [ -n "${DB_PASS}" ] && [ -z "${DB01_PASS}" ] ; then export DB01_PASS="${DB_PASS}" ; unset DB_PASS ; fi
         database_init_file=$(sudo -u mariadb mktemp)
-        floop "$(printenv | sort | grep -cE '^DB([0-9].)_NAME')" create_database EMAN_BD
-        echo "FLUSH PRIVILEGES" | silent sudo -u mariadb tee -a "${database_init_file}"
-        mariadb_control_server stop
-        mariadb_control_server start "--init-file=${database_init_file}"
-        mariadb_control_server stop
-        rm -f "${database_init_file}"
+        floop "$(printenv | sort | grep -cE '^DB([0-9]{2})_NAME')" create_database EMAN_BD
+        if grep -qE '^(CREATE DATABASE|GRANT ALL)' "${database_init_file}" 2>/dev/null ; then
+            write_file -a mariadb@"${database_init_file}" <<EOF
+FLUSH PRIVILEGES;
+EOF
+            mariadb_control_server stop || {
+                print_error "[create_databases] Could not stop temporary server - halting initialization"
+                pkill -f /usr/bin/mariadbd
+                exit 1
+            }
+            mariadb_control_server start "--init-file=${database_init_file}" || {
+                print_error "[create_databases] Init-file run failed to start - halting initialization, keeping '${database_init_file}' for inspection"
+                pkill -f /usr/bin/mariadbd
+                exit 1
+            }
+            mariadb_control_server stop || {
+                print_error "[create_databases] Init-file server did not stop cleanly - halting initialization, keeping '${database_init_file}' for inspection"
+                pkill -f /usr/bin/mariadbd
+                exit 1
+            }
+            rm -f "${database_init_file}"
+        else
+            print_debug "[create_databases] No database or grant changes to apply - skipping init-file run"
+            mariadb_control_server stop || {
+                print_error "[create_databases] Could not stop temporary server - halting initialization"
+                pkill -f "/usr/bin/mariadbd"
+                rm -f "${database_init_file}"
+                exit 1
+            }
+            rm -f "${database_init_file}"
+        fi
     fi
 }
 
