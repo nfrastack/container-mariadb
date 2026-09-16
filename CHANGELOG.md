@@ -1,3 +1,10 @@
+## 11.4-5.1.3 2026-09-15 <code at nfrastack dot com>
+
+   ### Added
+      - Fix initialization routines on second startup potentially introducing data loss
+      - Repair MARIADB_|MYSQL_ env bridge
+
+
 ## 11.4-5.1.2 2026-05-27 <code at nfrastack dot com>
 
    ### Added
