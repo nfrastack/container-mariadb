@@ -1,3 +1,10 @@
+## 12.3-5.1.5 2026-09-15 <code at nfrastack dot com>
+
+   ### Added
+      - Fix initialization routines on second startup potentially introducing data loss
+      - Repair MARIADB_|MYSQL_ env bridge
+
+
 ## 12.3-5.1.4 2026-09-15 <code at nfrastack dot com>
 
 MariaDB 12.3.3
